@@ -1,4 +1,18 @@
-# Proper ResNet Implementation for CIFAR10/CIFAR100 in Pytorch
+# ResNet for CIFAR10/CIFAR100/SVHN to generate entropy list
+The reference code is https://github.com/akamaster/pytorch_resnet_cifar10 .
+
+The first step is to train a model for each dataset.
+
+Please check the ```run_train.sh```.
+
+Note that we also make the trained parameters of models for CIFAR10/CIFAR100/SVHN public.
+
+The second step is to generate entropy list of training dataset using a trained model.
+
+Please check the ```run_eval.sh```.
+
+## README in the reference code
+
 [Torchvision model zoo](https://github.com/pytorch/vision/tree/master/torchvision/models) provides number of implementations of various state-of-the-art architectures, however, most of them are defined and implemented for ImageNet.
 Usually it is straightforward to use the provided models on other datasets, but some cases require manual setup.
 
