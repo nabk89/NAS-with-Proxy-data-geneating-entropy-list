@@ -2,9 +2,13 @@ import argparse
 import os
 import shutil
 import time
+import datetime
+
+import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim
@@ -47,6 +51,12 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
+
+#####################################################################################
+parser.add_argument('--dataset', default='cifar10', type=str)
+parser.add_argument('--model_path', default='', type=str)
+#####################################################################################
+
 parser.add_argument('--half', dest='half', action='store_true',
                     help='use half-precision(16-bit) ')
 parser.add_argument('--save-dir', dest='save_dir',
@@ -62,12 +72,16 @@ def main():
     global args, best_prec1
     args = parser.parse_args()
 
-
     # Check the save_dir exists or not
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+    #os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    #model = torch.nn.DataParallel(resnet.__dict__[args.arch]())  # CIFAR-10
+    model = resnet.__dict__[args.arch](100 if args.dataset == 'cifar100' else 10) # CIFAR-100, SVHN
+    if args.model_path:
+      ckpt = torch.load(args.model_path, map_location='cpu')
+      model.load_state_dict(ckpt['state_dict'])
     model.cuda()
 
     # optionally resume from a checkpoint
@@ -85,25 +99,49 @@ def main():
 
     cudnn.benchmark = True
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    if args.dataset == 'cifar10':
+      normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                       std=[0.229, 0.224, 0.225])
+    elif args.dataset == 'cifar100':
+      normalize = transforms.Normalize(mean=[0.5071, 0.4865, 0.4409],
+                                       std=[0.2673, 0.2564, 0.2762])
+    elif args.dataset == 'svhn':
+      normalize = transforms.Normalize(mean=[0.4377, 0.4438, 0.4728],
+                                       std=[0.198, 0.201, 0.197])
+    else:
+      raise ValueError("Wrong") 
+
+    train_transforms = transforms.Compose([
+            transforms.RandomCrop(32, 4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ]) 
+    val_transforms = transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+        ]) 
+    if args.evaluate:
+        train_transforms = val_transforms
+
+    if args.dataset == 'cifar10':
+      train_data = datasets.CIFAR10(root='../data', train=True, transform=train_transforms, download=True)
+      val_data = datasets.CIFAR10(root='../data', train=False, transform=val_transforms, download=True)
+    elif args.dataset == 'cifar100':
+      train_data = datasets.CIFAR100(root='../data', train=True, transform=train_transforms, download=True)
+      val_data = datasets.CIFAR100(root='../data', train=False, transform=val_transforms, download=True)
+    elif args.dataset == 'svhn':
+      train_data = datasets.SVHN(root='../data', split='train', transform=train_transforms, download=True)
+      val_data = datasets.SVHN(root='../data', split='test', transform=val_transforms, download=True)
+    else:
+      raise ValueError("Wrong") 
+
 
     train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(32, 4),
-            transforms.ToTensor(),
-            normalize,
-        ]), download=True),
-        batch_size=args.batch_size, shuffle=True,
+        train_data, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True)
-
     val_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=128, shuffle=False,
+        val_data, batch_size=256, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
@@ -127,10 +165,16 @@ def main():
             param_group['lr'] = args.lr*0.1
 
 
+    # obtain entropy of training data
     if args.evaluate:
-        validate(val_loader, model, criterion)
+        validate(train_loader, model, criterion)
+        ## uncomment when you need to check the validation accuracy
+        #validate(val_loader, model, criterion)
         return
 
+    start_time = time.time()
+    print(datetime.datetime.now())
+    best_epoch=0
     for epoch in range(args.start_epoch, args.epochs):
 
         # train for one epoch
@@ -152,10 +196,14 @@ def main():
                 'best_prec1': best_prec1,
             }, is_best, filename=os.path.join(args.save_dir, 'checkpoint.th'))
 
-        save_checkpoint({
+        if is_best:
+          best_epoch = epoch
+          save_checkpoint({
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
-        }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
+          }, is_best, filename=os.path.join(args.save_dir, 'best_model.th'))
+    print('best acc {:.4f} at epoch {:}'.format(best_prec1, best_epoch))
+    print('elpased time: {:.4f} sec'.format(time.time() - start_time))
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
@@ -216,12 +264,17 @@ def validate(val_loader, model, criterion):
     """
     Run evaluation
     """
+    infer_start = time.time()
+
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
 
     # switch to evaluate mode
     model.eval()
+
+    entropy_list = []
+    target_list = []
 
     end = time.time()
     with torch.no_grad():
@@ -235,6 +288,12 @@ def validate(val_loader, model, criterion):
 
             # compute output
             output = model(input_var)
+
+            # entropy extraction (nabk)
+            ent = entropy(output.data)
+            entropy_list.extend(ent.tolist())
+            target_list.extend(target.tolist())
+
             loss = criterion(output, target_var)
 
             output = output.float()
@@ -259,6 +318,12 @@ def validate(val_loader, model, criterion):
 
     print(' * Prec@1 {top1.avg:.3f}'
           .format(top1=top1))
+
+    f = open(args.dataset + "_" + args.arch + "_index_entropy_class.txt", 'w')
+    for i, ent, target in zip(range(len(entropy_list)), entropy_list, target_list):
+      f.write(str(i) + '\t' + str(ent) + '\t' + str(target) + '\n')
+    f.close()
+    return 
 
     return top1.avg
 
@@ -293,6 +358,7 @@ def accuracy(output, target, topk=(1,)):
 
     _, pred = output.topk(maxk, 1, True, True)
     pred = pred.t()
+
     correct = pred.eq(target.view(1, -1).expand_as(pred))
 
     res = []
@@ -300,6 +366,11 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
+
+def entropy(data):
+  tmp = F.softmax(data, dim=1) * F.log_softmax(data, dim=1)
+  tmp = -1.0 * tmp.sum(dim=1)
+  return tmp
 
 
 if __name__ == '__main__':
